@@ -99,7 +99,7 @@ jobs:
               "bonfire": {
                 "path": "crates/bonfire",
                 "ghcr-tag": "metaverserpn-llc/bonfire",
-                "docker-tag": "nacjm/bonfire",\
+                "docker-tag": "nacjm/bonfire",
               }
             }
           export_to: output
