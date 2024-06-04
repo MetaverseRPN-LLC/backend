@@ -93,11 +93,11 @@ jobs:
             {
               "delta": {
                 "path": "crates/delta",
-                "tag": "${{ github.repository_owner }}/server"
+                "tag": "$metaverserpn-llc/server"
               },
               "bonfire": {
                 "path": "crates/bonfire",
-                "tag": "${{ github.repository_owner }}/bonfire"
+                "tag": "$metaverserpn-llc/bonfire"
               }
             }
           export_to: output
