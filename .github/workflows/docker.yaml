@@ -93,11 +93,13 @@ jobs:
             {
               "delta": {
                 "path": "crates/delta",
-                "tag": "metaverserpn-llc/server"
+                "ghcr-tag": "metaverserpn-llc/server",
+                "docker-tag": "nacjm/server"
               },
               "bonfire": {
                 "path": "crates/bonfire",
-                "tag": "metaverserpn-llc/bonfire"
+                "ghcr-tag": "metaverserpn-llc/bonfire"
+                "docker-tag": "nacjm/bonfire"
               }
             }
           export_to: output
@@ -108,8 +110,8 @@ jobs:
         uses: docker/metadata-action@v4
         with:
           images: |
-            docker.io/${{ steps.export.outputs.tag }}
-            ghcr.io/${{ steps.export.outputs.tag }}
+            docker.io/${{ steps.export.outputs.docker-tag }}
+            ghcr.io/${{ steps.export.outputs.ghcr-tag }}
 
       # Build crate image
       - name: Publish
