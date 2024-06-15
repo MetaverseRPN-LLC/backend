@@ -1,6 +1,7 @@
-use std::net::SocketAddr;
+use std::{collections::HashSet, net::SocketAddr, sync::Arc};
 
 use async_tungstenite::WebSocketStream;
+use authifier::AuthifierEvent;
 use fred::{
     interfaces::{ClientLike, EventInterface, PubsubInterface},
     types::RedisConfig,
@@ -18,7 +19,11 @@ use revolt_database::{
 };
 use revolt_presence::{create_session, delete_session};
 
-use async_std::{net::TcpStream, sync::Mutex};
+use async_std::{
+    net::TcpStream,
+    sync::{Mutex, RwLock},
+};
+use revolt_result::create_error;
 
 use crate::config::{ProtocolConfiguration, WebsocketHandshakeCallback};
 use crate::events::state::{State, SubscriptionStateChange};
@@ -42,6 +47,7 @@ pub async fn client(db: &'static Database, stream: TcpStream, addr: SocketAddr) 
     else {
         return;
     };
+
     // Verify we've received a valid config, otherwise we should just drop the connection.
     let Ok(mut config) = receiver.await else {
         return;
@@ -69,19 +75,22 @@ pub async fn client(db: &'static Database, stream: TcpStream, addr: SocketAddr) 
 
     // Try to authenticate the user.
     let Some(token) = config.get_session_token().as_ref() else {
+        write.send(config.encode(&create_error!(InvalidSession))).await.ok();
         return;
     };
-    let user = match User::from_token(db, token, UserHint::Any).await {
+
+    let (user, session_id) = match User::from_token(db, token, UserHint::Any).await {
         Ok(user) => user,
         Err(err) => {
             write.send(config.encode(&err)).await.ok();
             return;
         }
     };
+
     info!("User {addr:?} authenticated as @{}", user.username);
 
     // Create local state.
-    let mut state = State::from(user);
+    let mut state = State::from(user, session_id);
     let user_id = state.cache.user_id.clone();
 
     // Notify socket we have authenticated.
@@ -97,6 +106,7 @@ pub async fn client(db: &'static Database, stream: TcpStream, addr: SocketAddr) 
     let Ok(ready_payload) = state.generate_ready_payload(db).await else {
         return;
     };
+
     if write.send(config.encode(&ready_payload)).await.is_err() {
         return;
     }
@@ -111,10 +121,12 @@ pub async fn client(db: &'static Database, stream: TcpStream, addr: SocketAddr) 
 
     {
         let write = Mutex::new(write);
+        let subscribed = state.subscribed.clone();
+
         // Create a PubSub connection to poll on.
         let listener = listener(db, &mut state, addr, &config, &write).fuse();
         // Read from WebSocket stream.
-        let worker = worker(addr, user_id.clone(), &config, read, &write).fuse();
+        let worker = worker(addr, subscribed, user_id.clone(), &config, read, &write).fuse();
 
         // Pin both tasks.
         pin_mut!(listener, worker);
@@ -152,10 +164,12 @@ async fn listener(
     let mut message_rx = subscriber.message_rx();
     loop {
         // Check for state changes for subscriptions.
-        match state.apply_state() {
+        match state.apply_state().await {
             SubscriptionStateChange::Reset => {
                 subscriber.unsubscribe_all().await.unwrap();
-                for id in state.iter_subscriptions() {
+
+                let subscribed = state.subscribed.read().await;
+                for id in subscribed.iter() {
                     subscriber.subscribe(id).await.unwrap();
                 }
 
@@ -187,6 +201,7 @@ async fn listener(
         }) else {
             return;
         };
+
         let event = match *REDIS_PAYLOAD_TYPE {
             PayloadType::Json => message
                 .value
@@ -201,13 +216,34 @@ async fn listener(
                 .as_bytes()
                 .and_then(|b| bincode::deserialize::<EventV1>(b).ok()),
         };
+
         let Some(mut event) = event else {
             warn!("Failed to deserialise an event for {}!", message.channel);
             return;
         };
-        let should_send = state.handle_incoming_event_v1(db, &mut event).await;
-        if !should_send {
-            continue;
+
+        if let EventV1::Auth(auth) = &event {
+            if let AuthifierEvent::DeleteSession { session_id, .. } = auth {
+                if &state.session_id == session_id {
+                    event = EventV1::Logout;
+                }
+            } else if let AuthifierEvent::DeleteAllSessions {
+                exclude_session_id, ..
+            } = auth
+            {
+                if let Some(excluded) = exclude_session_id {
+                    if &state.session_id != excluded {
+                        event = EventV1::Logout;
+                    }
+                } else {
+                    event = EventV1::Logout;
+                }
+            }
+        } else {
+            let should_send = state.handle_incoming_event_v1(db, &mut event).await;
+            if !should_send {
+                continue;
+            }
         }
 
         let result = write.lock().await.send(config.encode(&event)).await;
@@ -216,6 +252,11 @@ async fn listener(
             if !matches!(e, Error::AlreadyClosed | Error::ConnectionClosed) {
                 warn!("Error while sending an event to {addr:?}: {e:?}");
             }
+
+            return;
+        }
+
+        if let EventV1::Logout = event {
             return;
         }
     }
@@ -223,6 +264,7 @@ async fn listener(
 
 async fn worker(
     addr: SocketAddr,
+    subscribed: Arc<RwLock<HashSet<String>>>,
     user_id: String,
     config: &ProtocolConfiguration,
     mut read: WsReader,
@@ -245,8 +287,13 @@ async fn worker(
         let Ok(payload) = config.decode(&msg) else {
             continue;
         };
+
         match payload {
             ClientMessage::BeginTyping { channel } => {
+                if !subscribed.read().await.contains(&channel) {
+                    continue;
+                }
+
                 EventV1::ChannelStartTyping {
                     id: channel.clone(),
                     user: user_id.clone(),
@@ -255,6 +302,10 @@ async fn worker(
                 .await;
             }
             ClientMessage::EndTyping { channel } => {
+                if !subscribed.read().await.contains(&channel) {
+                    continue;
+                }
+
                 EventV1::ChannelStopTyping {
                     id: channel.clone(),
                     user: user_id.clone(),

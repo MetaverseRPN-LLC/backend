@@ -48,7 +48,29 @@ cp .env.example .env
 # (optionally) copy the default configuration file
 cp crates/core/config/Revolt.toml Revolt.toml
 # configure as necessary...
+```
 
+You may want to copy the following configuration:
+
+```toml
+# Revolt.toml
+[database]
+mongodb = "mongodb://localhost"
+redis = "redis://localhost"
+
+[hosts]
+app = "http://local.revolt.chat"
+api = "http://local.revolt.chat:8000"
+events = "ws://local.revolt.chat:9000"
+autumn = "http://local.revolt.chat:3000"
+january = "http://local.revolt.chat:7000"
+voso_legacy = ""
+voso_legacy_ws = ""
+```
+
+Then continue:
+
+```bash
 # start other necessary services
 docker compose up -d
 
@@ -103,6 +125,23 @@ Tag and push a new release by running:
 
 ```bash
 just release
+```
+
+If you have bumped the crate versions, proceed to [GitHub releases](https://github.com/revoltchat/backend/releases/new) to create a changelog.
+
+## Testing
+
+First, start the required services:
+
+```sh
+docker compose -f docker-compose.db.yml up -d
+```
+
+Now run tests for whichever database:
+
+```sh
+TEST_DB=REFERENCE cargo nextest run
+TEST_DB=MONGOBD cargo nextest run
 ```
 
 ## License
