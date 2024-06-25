@@ -106,9 +106,8 @@ pub async fn edit(
         let added_roles: Vec<&&String> = new_roles.difference(&current_roles).collect();
 
         for role_id in added_roles {
-            if let Some(role) = server.roles.remove(*role_id) {
-                if member.id.user == server.owner {eprintln!("You Are Owner");}
-                else if role.rank <= our_ranking {
+            if let Some(role) = server.roles.remove(*role_id){
+                if role.rank <= our_ranking {
                     return Err(create_error!(NotElevated));
                 }
             } else {
