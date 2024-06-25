@@ -1,8 +1,8 @@
 [package]
 name = "revolt-models"
-version = "0.7.2"
+version = "0.7.4"
 edition = "2021"
-license = "AGPL-3.0-or-later"
+license = "MIT"
 authors = ["Paul Makles <me@insrt.uk>"]
 description = "Revolt Backend: API Models"
 
@@ -19,8 +19,8 @@ default = ["serde", "partials", "rocket"]
 
 [dependencies]
 # Core
-revolt-config = { version = "0.7.2", path = "../config" }
-revolt-permissions = { version = "0.7.2", path = "../permissions" }
+revolt-config = { version = "0.7.4", path = "../config" }
+revolt-permissions = { version = "0.7.4", path = "../permissions" }
 
 # Utility
 regex = "1"
