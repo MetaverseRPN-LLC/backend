@@ -36,15 +36,16 @@ pub async fn edit(
     let mut query = DatabasePermissionQuery::new(db, &user)
         .server(&server)
         .member(&member);
+
     let permissions = calculate_server_permissions(&mut query).await;
 
     // Check permissions in server
     if data.nickname.is_some()
         || data
-            .remove
-            .as_ref()
-            .map(|x| x.contains(&v0::FieldsMember::Nickname))
-            .unwrap_or_default()
+        .remove
+        .as_ref()
+        .map(|x| x.contains(&v0::FieldsMember::Nickname))
+        .unwrap_or_default()
     {
         if user.id == member.id.user {
             permissions.throw_if_lacking_channel_permission(ChannelPermission::ChangeNickname)?;
@@ -55,10 +56,10 @@ pub async fn edit(
 
     if data.avatar.is_some()
         || data
-            .remove
-            .as_ref()
-            .map(|x| x.contains(&v0::FieldsMember::Avatar))
-            .unwrap_or_default()
+        .remove
+        .as_ref()
+        .map(|x| x.contains(&v0::FieldsMember::Avatar))
+        .unwrap_or_default()
     {
         if user.id == member.id.user {
             permissions.throw_if_lacking_channel_permission(ChannelPermission::ChangeAvatar)?;
@@ -69,20 +70,20 @@ pub async fn edit(
 
     if data.roles.is_some()
         || data
-            .remove
-            .as_ref()
-            .map(|x| x.contains(&v0::FieldsMember::Roles))
-            .unwrap_or_default()
+        .remove
+        .as_ref()
+        .map(|x| x.contains(&v0::FieldsMember::Roles))
+        .unwrap_or_default()
     {
         permissions.throw_if_lacking_channel_permission(ChannelPermission::AssignRoles)?;
     }
 
     if data.timeout.is_some()
         || data
-            .remove
-            .as_ref()
-            .map(|x| x.contains(&v0::FieldsMember::Timeout))
-            .unwrap_or_default()
+        .remove
+        .as_ref()
+        .map(|x| x.contains(&v0::FieldsMember::Timeout))
+        .unwrap_or_default()
     {
         permissions.throw_if_lacking_channel_permission(ChannelPermission::TimeoutMembers)?;
     }
@@ -106,7 +107,8 @@ pub async fn edit(
 
         for role_id in added_roles {
             if let Some(role) = server.roles.remove(*role_id) {
-                if role.rank <= our_ranking {
+                if member.id.user == server.owner {eprintln!("You Are Owner");}
+                else if role.rank <= our_ranking {
                     return Err(create_error!(NotElevated));
                 }
             } else {
