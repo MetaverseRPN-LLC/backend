@@ -30,11 +30,10 @@ pub async fn edit(
         })
     })?;
 
-    let config = config().await;
     Message::validate_sum(
         &edit.content,
         edit.embeds.as_deref().unwrap_or_default(),
-        config.features.limits.default.message_length,
+        user.limits().await.message_length,
     )?;
 
     // Ensure we have permissions to send a message
@@ -98,5 +97,5 @@ pub async fn edit(
         }
     }
 
-    Ok(Json(message.into()))
+    Ok(Json(message.into_model(None, None)))
 }

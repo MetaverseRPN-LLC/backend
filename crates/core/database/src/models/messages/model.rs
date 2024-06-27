@@ -2,10 +2,10 @@ use std::collections::HashSet;
 
 use indexmap::{IndexMap, IndexSet};
 use iso8601_timestamp::Timestamp;
-use revolt_config::config;
+use revolt_config::{config, FeaturesLimits};
 use revolt_models::v0::{
-    self, BulkMessageResponse, DataMessageSend, Embed, MessageAuthor, MessageSort, MessageWebhook,
-    PushNotification, ReplyIntent, SendableEmbed, Text, RE_MENTION,
+    self, BulkMessageResponse, DataMessageSend, Embed, MessageAuthor, MessageFlags, MessageSort,
+    MessageWebhook, PushNotification, ReplyIntent, SendableEmbed, Text, RE_MENTION,
 };
 use revolt_permissions::{ChannelPermission, PermissionValue};
 use revolt_result::Result;
@@ -65,6 +65,10 @@ auto_derived_partial!(
         /// Name and / or avatar overrides for this message
         #[serde(skip_serializing_if = "Option::is_none")]
         pub masquerade: Option<Masquerade>,
+
+        /// Bitfield of message flags
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub flags: Option<i32>,
     },
     "PartialMessage"
 );
@@ -200,6 +204,7 @@ impl Default for Message {
             reactions: Default::default(),
             interactions: Default::default(),
             masquerade: None,
+            flags: None,
         }
     }
 }
@@ -207,11 +212,15 @@ impl Default for Message {
 #[allow(clippy::disallowed_methods)]
 impl Message {
     /// Create message from API data
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_from_api(
         db: &Database,
         channel: Channel,
         data: DataMessageSend,
         author: MessageAuthor<'_>,
+        user: Option<v0::User>,
+        member: Option<v0::Member>,
+        limits: FeaturesLimits,
         mut idempotency: IdempotencyKey,
         generate_embeds: bool,
         allow_mentions: bool,
@@ -221,7 +230,7 @@ impl Message {
         Message::validate_sum(
             &data.content,
             data.embeds.as_deref().unwrap_or_default(),
-            config.features.limits.default.message_length,
+            limits.message_length,
         )?;
 
         idempotency
@@ -235,6 +244,13 @@ impl Message {
             && (data.embeds.as_ref().map_or(true, |v| v.is_empty()))
         {
             return Err(create_error!(EmptyMessage));
+        }
+
+        // Ensure flags are either not set or have permissible values
+        if let Some(flags) = &data.flags {
+            if flags != &0 && flags != &1 {
+                return Err(create_error!(InvalidProperty));
+            }
         }
 
         // Ensure restrict_reactions is not specified without reactions list
@@ -270,6 +286,7 @@ impl Message {
                 .unwrap_or_default(),
             author: author_id,
             webhook: webhook.map(|w| w.into()),
+            flags: data.flags.map(|v| v as i32),
             ..Default::default()
         };
 
@@ -288,9 +305,9 @@ impl Message {
         // Verify replies are valid.
         let mut replies = HashSet::new();
         if let Some(entries) = data.replies {
-            if entries.len() > config.features.limits.default.message_replies {
+            if entries.len() > config.features.limits.global.message_replies {
                 return Err(create_error!(TooManyReplies {
-                    max: config.features.limits.default.message_replies,
+                    max: config.features.limits.global.message_replies,
                 }));
             }
 
@@ -320,20 +337,20 @@ impl Message {
         if data
             .attachments
             .as_ref()
-            .is_some_and(|v| v.len() > config.features.limits.default.message_attachments)
+            .is_some_and(|v| v.len() > limits.message_attachments)
         {
             return Err(create_error!(TooManyAttachments {
-                max: config.features.limits.default.message_attachments,
+                max: limits.message_attachments,
             }));
         }
 
         if data
             .embeds
             .as_ref()
-            .is_some_and(|v| v.len() > config.features.limits.default.message_embeds)
+            .is_some_and(|v| v.len() > config.features.limits.global.message_embeds)
         {
             return Err(create_error!(TooManyEmbeds {
-                max: config.features.limits.default.message_embeds,
+                max: config.features.limits.global.message_embeds,
             }));
         }
 
@@ -360,7 +377,9 @@ impl Message {
         message.nonce = Some(idempotency.into_key());
 
         // Send the message
-        message.send(db, author, &channel, generate_embeds).await?;
+        message
+            .send(db, author, user, member, &channel, generate_embeds)
+            .await?;
 
         Ok(message)
     }
@@ -369,13 +388,15 @@ impl Message {
     pub async fn send_without_notifications(
         &mut self,
         db: &Database,
+        user: Option<v0::User>,
+        member: Option<v0::Member>,
         is_dm: bool,
         generate_embeds: bool,
     ) -> Result<()> {
         db.insert_message(self).await?;
 
         // Fan out events
-        EventV1::Message(self.clone().into())
+        EventV1::Message(self.clone().into_model(user, member))
             .p(self.channel.to_string())
             .await;
 
@@ -416,29 +437,40 @@ impl Message {
         &mut self,
         db: &Database,
         author: MessageAuthor<'_>,
+        user: Option<v0::User>,
+        member: Option<v0::Member>,
         channel: &Channel,
         generate_embeds: bool,
     ) -> Result<()> {
         self.send_without_notifications(
             db,
+            user,
+            member,
             matches!(channel, Channel::DirectMessage { .. }),
             generate_embeds,
         )
         .await?;
 
-        // Push out Web Push notifications
-        crate::tasks::web_push::queue(
-            {
-                match channel {
-                    Channel::DirectMessage { recipients, .. }
-                    | Channel::Group { recipients, .. } => recipients.clone(),
-                    Channel::TextChannel { .. } => self.mentions.clone().unwrap_or_default(),
-                    _ => vec![],
-                }
-            },
-            PushNotification::from(self.clone().into(), Some(author), &channel.id()).await,
-        )
-        .await;
+        if !self.has_suppressed_notifications() {
+            // Push out Web Push notifications
+            crate::tasks::web_push::queue(
+                {
+                    match channel {
+                        Channel::DirectMessage { recipients, .. }
+                        | Channel::Group { recipients, .. } => recipients.clone(),
+                        Channel::TextChannel { .. } => self.mentions.clone().unwrap_or_default(),
+                        _ => vec![],
+                    }
+                },
+                PushNotification::from(
+                    self.clone().into_model(None, None),
+                    Some(author),
+                    &channel.id(),
+                )
+                .await,
+            )
+            .await;
+        }
 
         Ok(())
     }
@@ -470,6 +502,16 @@ impl Message {
         }))
     }
 
+    /// Whether this message has suppressed notifications
+    pub fn has_suppressed_notifications(&self) -> bool {
+        if let Some(flags) = self.flags {
+            flags & MessageFlags::SupressNotifications as i32
+                == MessageFlags::SupressNotifications as i32
+        } else {
+            false
+        }
+    }
+
     /// Update message data
     pub async fn update(&mut self, db: &Database, partial: PartialMessage) -> Result<()> {
         self.apply_options(partial.clone());
@@ -498,13 +540,41 @@ impl Message {
             .fetch_messages(query)
             .await?
             .into_iter()
-            .map(Into::into)
+            .map(|msg| msg.into_model(None, None))
             .collect();
 
         if let Some(true) = include_users {
             let user_ids = messages
                 .iter()
-                .map(|m| m.author.clone())
+                .flat_map(|m| {
+                    let mut users = vec![m.author.clone()];
+                    if let Some(system) = &m.system {
+                        match system {
+                            v0::SystemMessage::ChannelDescriptionChanged { by } => {
+                                users.push(by.clone())
+                            }
+                            v0::SystemMessage::ChannelIconChanged { by } => users.push(by.clone()),
+                            v0::SystemMessage::ChannelOwnershipChanged { from, to, .. } => {
+                                users.push(from.clone());
+                                users.push(to.clone())
+                            }
+                            v0::SystemMessage::ChannelRenamed { by, .. } => users.push(by.clone()),
+                            v0::SystemMessage::UserAdded { by, id, .. }
+                            | v0::SystemMessage::UserRemove { by, id, .. } => {
+                                users.push(by.clone());
+                                users.push(id.clone());
+                            }
+                            v0::SystemMessage::UserBanned { id, .. }
+                            | v0::SystemMessage::UserKicked { id, .. }
+                            | v0::SystemMessage::UserJoined { id, .. }
+                            | v0::SystemMessage::UserLeft { id, .. } => {
+                                users.push(id.clone());
+                            }
+                            v0::SystemMessage::Text { .. } => {}
+                        }
+                    }
+                    users
+                })
                 .collect::<HashSet<String>>()
                 .into_iter()
                 .collect::<Vec<String>>();
@@ -588,7 +658,7 @@ impl Message {
     pub async fn add_reaction(&self, db: &Database, user: &User, emoji: &str) -> Result<()> {
         // Check how many reactions are already on the message
         let config = config().await;
-        if self.reactions.len() >= config.features.limits.default.message_reactions
+        if self.reactions.len() >= config.features.limits.global.message_reactions
             && !self.reactions.contains_key(emoji)
         {
             return Err(create_error!(InvalidOperation));
@@ -753,7 +823,7 @@ impl Interactions {
         if let Some(reactions) = &self.reactions {
             permissions.throw_if_lacking_channel_permission(ChannelPermission::React)?;
 
-            if reactions.len() > config.features.limits.default.message_reactions {
+            if reactions.len() > config.features.limits.global.message_reactions {
                 return Err(create_error!(InvalidOperation));
             }
 

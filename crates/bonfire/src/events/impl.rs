@@ -92,6 +92,7 @@ impl State {
     /// Generate a Ready packet for the current user
     pub async fn generate_ready_payload(&mut self, db: &Database) -> Result<EventV1> {
         let user = self.clone_user();
+        self.cache.is_bot = user.bot.is_some();
 
         // Find all relationships to the user.
         let mut user_ids: HashSet<String> = user
@@ -179,7 +180,7 @@ impl State {
             .collect();
 
         // Make sure we see our own user correctly.
-        users.push(user.into_self().await);
+        users.push(user.into_self(true).await);
 
         // Set subscription state internally.
         self.reset_state().await;
@@ -191,6 +192,10 @@ impl State {
 
         for server in &servers {
             self.insert_subscription(server.id.clone()).await;
+
+            if self.cache.is_bot {
+                self.insert_subscription(format!("{}u", server.id)).await;
+            }
         }
 
         for channel in &channels {
@@ -397,6 +402,11 @@ impl State {
                 emojis: _,
             } => {
                 self.insert_subscription(id.clone()).await;
+
+                if self.cache.is_bot {
+                    self.insert_subscription(format!("{}u", id)).await;
+                }
+
                 self.cache.servers.insert(id.clone(), server.clone().into());
                 let member = Member {
                     id: MemberCompositeKey {
@@ -527,6 +537,20 @@ impl State {
                     self.insert_subscription(id.clone()).await;
                 } else {
                     self.remove_subscription(id).await;
+                }
+            }
+
+            EventV1::Message(message) => {
+                // Since Message events are fanned out to many clients,
+                // we must reconstruct the relationship value at this end.
+                if let Some(user) = &mut message.user {
+                    user.relationship = self
+                        .cache
+                        .users
+                        .get(&self.cache.user_id)
+                        .expect("missing self?")
+                        .relationship_with(&message.author)
+                        .into();
                 }
             }
 

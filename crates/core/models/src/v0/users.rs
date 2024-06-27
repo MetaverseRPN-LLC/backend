@@ -42,6 +42,8 @@ auto_derived_partial!(
         pub relations: Vec<Relationship>,
 
         /// Bitfield of user badges
+        ///
+        /// https://docs.rs/revolt-models/latest/revolt_models/v0/enum.UserBadges.html
         #[cfg_attr(
             feature = "serde",
             serde(skip_serializing_if = "crate::if_zero_u32", default)
@@ -50,11 +52,10 @@ auto_derived_partial!(
         /// User's current status
         #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
         pub status: Option<UserStatus>,
-        /// User's profile page
-        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
-        pub profile: Option<UserProfile>,
 
         /// Enum of user flags
+        ///
+        /// https://docs.rs/revolt-models/latest/revolt_models/v0/enum.UserFlags.html
         #[cfg_attr(
             feature = "serde",
             serde(skip_serializing_if = "crate::if_zero_u32", default)
@@ -86,6 +87,7 @@ auto_derived!(
         StatusPresence,
         ProfileContent,
         ProfileBackground,
+        DisplayName,
     }
 
     /// User's relationship with another user (or themselves)

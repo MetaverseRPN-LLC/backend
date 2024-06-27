@@ -1,10 +1,10 @@
-use std::{collections::HashSet, time::Duration};
+use std::{collections::HashSet, str::FromStr, time::Duration};
 
 use crate::{events::client::EventV1, Database, File, RatelimitEvent};
 
 use once_cell::sync::Lazy;
 use rand::seq::SliceRandom;
-use revolt_config::config;
+use revolt_config::{config, FeaturesLimits};
 use revolt_models::v0;
 use revolt_presence::filter_online;
 use revolt_result::{create_error, Result};
@@ -61,6 +61,7 @@ auto_derived!(
         StatusPresence,
         ProfileContent,
         ProfileBackground,
+        DisplayName,
     }
 
     /// User's relationship with another user (or themselves)
@@ -197,6 +198,22 @@ impl User {
         Ok(user)
     }
 
+    /// Get limits for this user
+    pub async fn limits(&self) -> FeaturesLimits {
+        let config = config().await;
+        if ulid::Ulid::from_str(&self.id)
+            .expect("`ulid`")
+            .datetime()
+            .elapsed()
+            .expect("time went backwards")
+            <= Duration::from_secs(86400u64 * config.features.limits.global.new_user_days as u64)
+        {
+            config.features.limits.new_user
+        } else {
+            config.features.limits.default
+        }
+    }
+
     /// Get the relationship with another user
     pub fn relationship_with(&self, user_b: &str) -> RelationshipStatus {
         if self.id == user_b {
@@ -235,12 +252,11 @@ impl User {
 
     /// Check if this user can acquire another server
     pub async fn can_acquire_server(&self, db: &Database) -> Result<()> {
-        let config = config().await;
-        if db.fetch_server_count(&self.id).await? <= config.features.limits.default.servers {
+        if db.fetch_server_count(&self.id).await? <= self.limits().await.servers {
             Ok(())
         } else {
             Err(create_error!(TooManyServers {
-                max: config.features.limits.default.servers
+                max: self.limits().await.servers
             }))
         }
     }
@@ -477,6 +493,7 @@ impl User {
             RelationshipStatus::Blocked => Err(create_error!(Blocked)),
             RelationshipStatus::BlockedOther => Err(create_error!(BlockedByOther)),
             RelationshipStatus::Incoming => {
+                // Accept incoming friend request
                 self.apply_relationship(
                     db,
                     target,
@@ -486,6 +503,26 @@ impl User {
                 .await
             }
             RelationshipStatus::None => {
+                // Get this user's current count of outgoing friend requests
+                let count = self
+                    .relations
+                    .as_ref()
+                    .map(|relations| {
+                        relations
+                            .iter()
+                            .filter(|r| matches!(r.status, RelationshipStatus::Outgoing))
+                            .count()
+                    })
+                    .unwrap_or_default();
+
+                // If we're over the limit, don't allow creating more requests
+                if count >= self.limits().await.outgoing_friend_requests {
+                    return Err(create_error!(TooManyPendingFriendRequests {
+                        max: self.limits().await.outgoing_friend_requests
+                    }));
+                }
+
+                // Send the friend request
                 self.apply_relationship(
                     db,
                     target,
@@ -621,6 +658,7 @@ impl User {
                     x.background = None;
                 }
             }
+            FieldsUser::DisplayName => self.display_name = None,
         }
     }
 

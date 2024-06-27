@@ -459,26 +459,29 @@ impl From<Metadata> for crate::Metadata {
     }
 }
 
-impl From<crate::Message> for Message {
-    fn from(value: crate::Message) -> Self {
+impl crate::Message {
+    pub fn into_model(self, user: Option<User>, member: Option<Member>) -> Message {
         Message {
-            id: value.id,
-            nonce: value.nonce,
-            channel: value.channel,
-            author: value.author,
-            webhook: value.webhook,
-            content: value.content,
-            system: value.system.map(|system| system.into()),
-            attachments: value
+            id: self.id,
+            nonce: self.nonce,
+            channel: self.channel,
+            author: self.author,
+            user,
+            member,
+            webhook: self.webhook,
+            content: self.content,
+            system: self.system.map(Into::into),
+            attachments: self
                 .attachments
                 .map(|v| v.into_iter().map(|f| f.into()).collect()),
-            edited: value.edited,
-            embeds: value.embeds,
-            mentions: value.mentions,
-            replies: value.replies,
-            reactions: value.reactions,
-            interactions: value.interactions.into(),
-            masquerade: value.masquerade.map(|masq| masq.into()),
+            edited: self.edited,
+            embeds: self.embeds,
+            mentions: self.mentions,
+            replies: self.replies,
+            reactions: self.reactions,
+            interactions: self.interactions.into(),
+            masquerade: self.masquerade.map(Into::into),
+            flags: self.flags.map(|flags| flags as u32).unwrap_or_default(),
         }
     }
 }
@@ -490,9 +493,11 @@ impl From<crate::PartialMessage> for PartialMessage {
             nonce: value.nonce,
             channel: value.channel,
             author: value.author,
+            user: None,
+            member: None,
             webhook: value.webhook,
             content: value.content,
-            system: value.system.map(|system| system.into()),
+            system: value.system.map(Into::into),
             attachments: value
                 .attachments
                 .map(|v| v.into_iter().map(|f| f.into()).collect()),
@@ -501,8 +506,9 @@ impl From<crate::PartialMessage> for PartialMessage {
             mentions: value.mentions,
             replies: value.replies,
             reactions: value.reactions,
-            interactions: value.interactions.map(|interactions| interactions.into()),
-            masquerade: value.masquerade.map(|masq| masq.into()),
+            interactions: value.interactions.map(Into::into),
+            masquerade: value.masquerade.map(Into::into),
+            flags: value.flags.map(|flags| flags as u32),
         }
     }
 }
@@ -1009,11 +1015,6 @@ impl crate::User {
             } else {
                 None
             },
-            profile: if can_see_profile {
-                self.profile.map(|profile| profile.into())
-            } else {
-                None
-            },
             flags: self.flags.unwrap_or_default() as u32,
             privileged: self.privileged,
             bot: self.bot.map(|bot| bot.into()),
@@ -1086,11 +1087,6 @@ impl crate::User {
             } else {
                 None
             },
-            profile: if can_see_profile {
-                self.profile.map(|profile| profile.into())
-            } else {
-                None
-            },
             flags: self.flags.unwrap_or_default() as u32,
             privileged: self.privileged,
             bot: self.bot.map(|bot| bot.into()),
@@ -1099,7 +1095,33 @@ impl crate::User {
         }
     }
 
-    pub async fn into_self(self) -> User {
+    /// Convert user object into user model without presence information
+    pub fn into_known_static<'a>(self, is_online: bool) -> User {
+        User {
+            username: self.username,
+            discriminator: self.discriminator,
+            display_name: self.display_name,
+            avatar: self.avatar.map(|file| file.into()),
+            relations: vec![],
+            badges: self.badges.unwrap_or_default() as u32,
+            online: is_online
+                && !matches!(
+                    self.status,
+                    Some(crate::UserStatus {
+                        presence: Some(crate::Presence::Invisible),
+                        ..
+                    })
+                ),
+            status: self.status.map(|status| status.into()),
+            flags: self.flags.unwrap_or_default() as u32,
+            privileged: self.privileged,
+            bot: self.bot.map(|bot| bot.into()),
+            relationship: RelationshipStatus::None, // events client will populate this from cache
+            id: self.id,
+        }
+    }
+
+    pub async fn into_self(self, force_online: bool) -> User {
         User {
             username: self.username,
             discriminator: self.discriminator,
@@ -1115,7 +1137,7 @@ impl crate::User {
                 })
                 .unwrap_or_default(),
             badges: self.badges.unwrap_or_default() as u32,
-            online: revolt_presence::is_online(&self.id).await
+            online: (force_online || revolt_presence::is_online(&self.id).await)
                 && !matches!(
                     self.status,
                     Some(crate::UserStatus {
@@ -1124,7 +1146,6 @@ impl crate::User {
                     })
                 ),
             status: self.status.map(|status| status.into()),
-            profile: self.profile.map(|profile| profile.into()),
             flags: self.flags.unwrap_or_default() as u32,
             privileged: self.privileged,
             bot: self.bot.map(|bot| bot.into()),
@@ -1152,7 +1173,7 @@ impl From<User> for crate::User {
             relations: None,
             badges: Some(value.badges as i32),
             status: value.status.map(Into::into),
-            profile: value.profile.map(Into::into),
+            profile: None,
             flags: Some(value.flags as i32),
             privileged: value.privileged,
             bot: value.bot.map(Into::into),
@@ -1175,7 +1196,6 @@ impl From<crate::PartialUser> for PartialUser {
             }),
             badges: value.badges.map(|badges| badges as u32),
             status: value.status.map(|status| status.into()),
-            profile: value.profile.map(|profile| profile.into()),
             flags: value.flags.map(|flags| flags as u32),
             privileged: value.privileged,
             bot: value.bot.map(|bot| bot.into()),
@@ -1194,6 +1214,7 @@ impl From<FieldsUser> for crate::FieldsUser {
             FieldsUser::ProfileContent => crate::FieldsUser::ProfileContent,
             FieldsUser::StatusPresence => crate::FieldsUser::StatusPresence,
             FieldsUser::StatusText => crate::FieldsUser::StatusText,
+            FieldsUser::DisplayName => crate::FieldsUser::DisplayName,
         }
     }
 }
@@ -1206,6 +1227,7 @@ impl From<crate::FieldsUser> for FieldsUser {
             crate::FieldsUser::ProfileContent => FieldsUser::ProfileContent,
             crate::FieldsUser::StatusPresence => FieldsUser::StatusPresence,
             crate::FieldsUser::StatusText => FieldsUser::StatusText,
+            crate::FieldsUser::DisplayName => FieldsUser::DisplayName,
         }
     }
 }

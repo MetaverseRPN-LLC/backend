@@ -24,23 +24,26 @@ pub async fn edit(
         })
     })?;
 
+    // Filter out invalid edit fields
+    if !user.privileged && (data.badges.is_some() || data.flags.is_some()) {
+        return Err(create_error!(NotPrivileged));
+    }
+
     // If we want to edit a different user than self, ensure we have
     // permissions and subsequently replace the user in question
     if target.id != "@me" && target.id != user.id {
         let target_user = target.as_user(db).await?;
         let is_bot_owner = target_user
             .bot
+            .as_ref()
             .map(|bot| bot.owner == user.id)
             .unwrap_or_default();
 
         if !is_bot_owner && !user.privileged {
             return Err(create_error!(NotPrivileged));
         }
-    }
 
-    // Otherwise, filter out invalid edit fields
-    if !user.privileged && (data.badges.is_some() || data.flags.is_some()) {
-        return Err(create_error!(NotPrivileged));
+        user = target_user;
     }
 
     // Exit out early if nothing is changed
@@ -52,7 +55,7 @@ pub async fn edit(
         && data.flags.is_none()
         && data.remove.is_none()
     {
-        return Ok(Json(user.into_self().await));
+        return Ok(Json(user.into_self(false).await));
     }
 
     // 1. Remove fields from object
@@ -126,5 +129,5 @@ pub async fn edit(
     )
     .await?;
 
-    Ok(Json(user.into_self().await))
+    Ok(Json(user.into_self(false).await))
 }

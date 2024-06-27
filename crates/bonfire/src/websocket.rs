@@ -3,12 +3,13 @@ use std::{collections::HashSet, net::SocketAddr, sync::Arc};
 use async_tungstenite::WebSocketStream;
 use authifier::AuthifierEvent;
 use fred::{
+    error::{RedisError, RedisErrorKind},
     interfaces::{ClientLike, EventInterface, PubsubInterface},
     types::RedisConfig,
 };
 use futures::{
     channel::oneshot,
-    pin_mut, select,
+    join, pin_mut, select,
     stream::{SplitSink, SplitStream},
     FutureExt, SinkExt, StreamExt, TryStreamExt,
 };
@@ -22,8 +23,10 @@ use revolt_presence::{create_session, delete_session};
 use async_std::{
     net::TcpStream,
     sync::{Mutex, RwLock},
+    task::spawn,
 };
 use revolt_result::create_error;
+use sentry::Level;
 
 use crate::config::{ProtocolConfiguration, WebsocketHandshakeCallback};
 use crate::events::state::{State, SubscriptionStateChange};
@@ -52,6 +55,7 @@ pub async fn client(db: &'static Database, stream: TcpStream, addr: SocketAddr) 
     let Ok(mut config) = receiver.await else {
         return;
     };
+
     info!(
         "User {addr:?} provided protocol configuration (version = {}, format = {:?})",
         config.get_protocol_version(),
@@ -63,10 +67,8 @@ pub async fn client(db: &'static Database, stream: TcpStream, addr: SocketAddr) 
 
     // If the user has not provided authentication, request information.
     if config.get_session_token().is_none() {
-        while let Ok(message) = read.try_next().await {
-            if let Ok(ClientMessage::Authenticate { token }) =
-                config.decode(message.as_ref().unwrap())
-            {
+        while let Ok(Some(message)) = read.try_next().await {
+            if let Ok(ClientMessage::Authenticate { token }) = config.decode(&message) {
                 config.set_session_token(token);
                 break;
             }
@@ -75,7 +77,10 @@ pub async fn client(db: &'static Database, stream: TcpStream, addr: SocketAddr) 
 
     // Try to authenticate the user.
     let Some(token) = config.get_session_token().as_ref() else {
-        write.send(config.encode(&create_error!(InvalidSession))).await.ok();
+        write
+            .send(config.encode(&create_error!(InvalidSession)))
+            .await
+            .ok();
         return;
     };
 
@@ -94,20 +99,24 @@ pub async fn client(db: &'static Database, stream: TcpStream, addr: SocketAddr) 
     let user_id = state.cache.user_id.clone();
 
     // Notify socket we have authenticated.
-    if write
-        .send(config.encode(&EventV1::Authenticated))
-        .await
-        .is_err()
-    {
+    if let Err(err) = write.send(config.encode(&EventV1::Authenticated)).await {
+        error!("Failed to write: {err:?}");
+        sentry::capture_error(&err);
         return;
     }
 
     // Download required data to local cache and send Ready payload.
-    let Ok(ready_payload) = state.generate_ready_payload(db).await else {
-        return;
+    let ready_payload = match state.generate_ready_payload(db).await {
+        Ok(ready_payload) => ready_payload,
+        Err(err) => {
+            sentry::capture_error(&err);
+            return;
+        }
     };
 
-    if write.send(config.encode(&ready_payload)).await.is_err() {
+    if let Err(err) = write.send(config.encode(&ready_payload)).await {
+        error!("Failed to write: {err:?}");
+        sentry::capture_error(&err);
         return;
     }
 
@@ -120,22 +129,44 @@ pub async fn client(db: &'static Database, stream: TcpStream, addr: SocketAddr) 
     }
 
     {
+        // Setup channels and mutexes
         let write = Mutex::new(write);
         let subscribed = state.subscribed.clone();
+        let active_servers = state.active_servers.clone();
+        let (topic_signal_s, topic_signal_r) = async_channel::unbounded();
+
+        // TODO: this needs to be rewritten
+        // Create channels through which the tasks can signal to each other they need to clean up
+        let (kill_signal_1_s, kill_signal_1_r) = async_channel::bounded(1);
+        let (kill_signal_2_s, kill_signal_2_r) = async_channel::bounded(1);
 
         // Create a PubSub connection to poll on.
-        let listener = listener(db, &mut state, addr, &config, &write).fuse();
-        // Read from WebSocket stream.
-        let worker = worker(addr, subscribed, user_id.clone(), &config, read, &write).fuse();
-
-        // Pin both tasks.
-        pin_mut!(listener, worker);
-
-        // Wait for either disconnect or for listener to die.
-        select!(
-            () = listener => {},
-            () = worker => {}
+        let listener = listener_with_kill_signal(
+            db,
+            &mut state,
+            addr,
+            &config,
+            topic_signal_r,
+            kill_signal_1_r,
+            &write,
+            kill_signal_2_s,
         );
+
+        // Read from WebSocket stream.
+        let worker = worker_with_kill_signal(
+            addr,
+            subscribed,
+            active_servers,
+            user_id.clone(),
+            &config,
+            topic_signal_s,
+            kill_signal_2_r,
+            read,
+            &write,
+            kill_signal_1_s,
+        );
+
+        join!(listener, worker);
     }
     // Clean up presence session.
     let last_session = delete_session(&user_id, session_id).await;
@@ -146,31 +177,88 @@ pub async fn client(db: &'static Database, stream: TcpStream, addr: SocketAddr) 
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn listener_with_kill_signal(
+    db: &'static Database,
+    state: &mut State,
+    addr: SocketAddr,
+    config: &ProtocolConfiguration,
+    topic_signal_r: async_channel::Receiver<()>,
+    kill_signal_r: async_channel::Receiver<()>,
+    write: &Mutex<WsWriter>,
+    kill_signal_s: async_channel::Sender<()>,
+) {
+    listener(
+        db,
+        state,
+        addr,
+        config,
+        topic_signal_r,
+        kill_signal_r,
+        write,
+    )
+    .await;
+    kill_signal_s.send(()).await.ok();
+}
+
 async fn listener(
     db: &'static Database,
     state: &mut State,
     addr: SocketAddr,
     config: &ProtocolConfiguration,
+    topic_signal_r: async_channel::Receiver<()>,
+    kill_signal_r: async_channel::Receiver<()>,
     write: &Mutex<WsWriter>,
 ) {
     let redis_config = RedisConfig::from_url(&REDIS_URI).unwrap();
-    let Ok(subscriber) = fred::types::Builder::from_config(redis_config).build_subscriber_client()
-    else {
+    let subscriber = match fred::types::Builder::from_config(redis_config).build_subscriber_client()
+    {
+        Ok(subscriber) => subscriber,
+        Err(err) => {
+            error!("Failed to build a subscriber: {err:?}");
+            sentry::capture_error(&err);
+            return;
+        }
+    };
+
+    if let Err(err) = subscriber.init().await {
+        error!("Failed to init subscriber: {err:?}");
+        sentry::capture_error(&err);
         return;
     };
-    if subscriber.init().await.is_err() {
-        return;
-    };
+
+    // Handle Redis connection dropping
+    let (clean_up_s, clean_up_r) = async_channel::bounded(1);
+    let clean_up_s = Arc::new(Mutex::new(clean_up_s));
+    subscriber.on_error(move |err| {
+        if let RedisErrorKind::Canceled = err.kind() {
+            let clean_up_s = clean_up_s.clone();
+            spawn(async move {
+                clean_up_s.lock().await.send(()).await.ok();
+            });
+        }
+
+        Ok(())
+    });
+
     let mut message_rx = subscriber.message_rx();
-    loop {
+    'out: loop {
         // Check for state changes for subscriptions.
         match state.apply_state().await {
             SubscriptionStateChange::Reset => {
-                subscriber.unsubscribe_all().await.unwrap();
+                if let Err(err) = subscriber.unsubscribe_all().await {
+                    error!("Unsubscribe all failed: {err:?}");
+                    sentry::capture_error(&err);
+                    break 'out;
+                }
 
                 let subscribed = state.subscribed.read().await;
                 for id in subscribed.iter() {
-                    subscriber.subscribe(id).await.unwrap();
+                    if let Err(err) = subscriber.subscribe(id).await {
+                        error!("Subscribe failed: {err:?}");
+                        sentry::capture_error(&err);
+                        break 'out;
+                    }
                 }
 
                 #[cfg(debug_assertions)]
@@ -181,149 +269,255 @@ async fn listener(
                     #[cfg(debug_assertions)]
                     info!("{addr:?} unsubscribing from {id}");
 
-                    subscriber.unsubscribe(id).await.unwrap();
+                    if let Err(err) = subscriber.unsubscribe(id).await {
+                        error!("Unsubscribe failed: {err:?}");
+                        sentry::capture_error(&err);
+                        break 'out;
+                    }
                 }
 
                 for id in add {
                     #[cfg(debug_assertions)]
                     info!("{addr:?} subscribing to {id}");
 
-                    subscriber.subscribe(id).await.unwrap();
+                    if let Err(err) = subscriber.subscribe(id).await {
+                        error!("Subscribe failed: {err:?}");
+                        sentry::capture_error(&err);
+                        break 'out;
+                    }
                 }
             }
             SubscriptionStateChange::None => {}
         }
 
-        // Handle incoming events.
-        let Ok(message) = message_rx.recv().await.map_err(|e| {
-            warn!("Error while consuming pub/sub messages: {e:?}");
-            sentry::capture_error(&e);
-        }) else {
-            return;
-        };
+        let t1 = message_rx.recv().fuse();
+        let t2 = topic_signal_r.recv().fuse();
+        let t3 = kill_signal_r.recv().fuse();
+        let t4 = clean_up_r.recv().fuse();
 
-        let event = match *REDIS_PAYLOAD_TYPE {
-            PayloadType::Json => message
-                .value
-                .as_str()
-                .and_then(|s| serde_json::from_str::<EventV1>(s.as_ref()).ok()),
-            PayloadType::Msgpack => message
-                .value
-                .as_bytes()
-                .and_then(|b| rmp_serde::from_slice::<EventV1>(b).ok()),
-            PayloadType::Bincode => message
-                .value
-                .as_bytes()
-                .and_then(|b| bincode::deserialize::<EventV1>(b).ok()),
-        };
+        pin_mut!(t1, t2, t3, t4);
 
-        let Some(mut event) = event else {
-            warn!("Failed to deserialise an event for {}!", message.channel);
-            return;
-        };
+        select! {
+            _ = t4 => {
+                break 'out;
+            },
+            _ = t3 => {
+                break 'out;
+            },
+            _ = t2 => {},
+            message = t1 => {
+                // Handle incoming events.
+                let message = match message {
+                    Ok(message) => message,
+                    Err(e) => {
+                        error!("Error while consuming pub/sub messages: {e:?}");
+                        sentry::capture_error(&e);
+                        break 'out;
+                    }
+                };
 
-        if let EventV1::Auth(auth) = &event {
-            if let AuthifierEvent::DeleteSession { session_id, .. } = auth {
-                if &state.session_id == session_id {
-                    event = EventV1::Logout;
-                }
-            } else if let AuthifierEvent::DeleteAllSessions {
-                exclude_session_id, ..
-            } = auth
-            {
-                if let Some(excluded) = exclude_session_id {
-                    if &state.session_id != excluded {
-                        event = EventV1::Logout;
+                let event = match *REDIS_PAYLOAD_TYPE {
+                    PayloadType::Json => message
+                        .value
+                        .as_str()
+                        .and_then(|s| serde_json::from_str::<EventV1>(s.as_ref()).ok()),
+                    PayloadType::Msgpack => message
+                        .value
+                        .as_bytes()
+                        .and_then(|b| rmp_serde::from_slice::<EventV1>(b).ok()),
+                    PayloadType::Bincode => message
+                        .value
+                        .as_bytes()
+                        .and_then(|b| bincode::deserialize::<EventV1>(b).ok()),
+                };
+
+                let Some(mut event) = event else {
+                    let err = format!(
+                        "Failed to deserialise an event for {}! Introspection: `{:?}`",
+                        message.channel,
+                        message
+                            .value
+                            .as_string()
+                            .map(|x| x.chars().take(32).collect::<String>())
+                    );
+
+                    error!("{}", err);
+                    sentry::capture_message(&err, Level::Error);
+                    break 'out;
+                };
+
+                if let EventV1::Auth(auth) = &event {
+                    if let AuthifierEvent::DeleteSession { session_id, .. } = auth {
+                        if &state.session_id == session_id {
+                            event = EventV1::Logout;
+                        }
+                    } else if let AuthifierEvent::DeleteAllSessions {
+                        exclude_session_id, ..
+                    } = auth
+                    {
+                        if let Some(excluded) = exclude_session_id {
+                            if &state.session_id != excluded {
+                                event = EventV1::Logout;
+                            }
+                        } else {
+                            event = EventV1::Logout;
+                        }
                     }
                 } else {
-                    event = EventV1::Logout;
+                    let should_send = state.handle_incoming_event_v1(db, &mut event).await;
+                    if !should_send {
+                        continue;
+                    }
+                }
+
+                let result = write.lock().await.send(config.encode(&event)).await;
+                if let Err(e) = result {
+                    use async_tungstenite::tungstenite::Error;
+                    if !matches!(e, Error::AlreadyClosed | Error::ConnectionClosed) {
+                        let err = format!("Error while sending an event to {addr:?}: {e:?}");
+                        warn!("{}", err);
+                        sentry::capture_message(&err, Level::Warning);
+                    }
+
+                    break 'out;
+                }
+
+                if let EventV1::Logout = event {
+                    info!("User {addr:?} received log out event!");
+                    break 'out;
                 }
             }
-        } else {
-            let should_send = state.handle_incoming_event_v1(db, &mut event).await;
-            if !should_send {
-                continue;
-            }
         }
+    }
 
-        let result = write.lock().await.send(config.encode(&event)).await;
-        if let Err(e) = result {
-            use async_tungstenite::tungstenite::Error;
-            if !matches!(e, Error::AlreadyClosed | Error::ConnectionClosed) {
-                warn!("Error while sending an event to {addr:?}: {e:?}");
-            }
-
-            return;
-        }
-
-        if let EventV1::Logout = event {
-            return;
-        }
+    if let Err(err) = subscriber.quit().await {
+        error!("{}", err);
+        sentry::capture_error(&err);
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn worker_with_kill_signal(
+    addr: SocketAddr,
+    subscribed: Arc<RwLock<HashSet<String>>>,
+    active_servers: Arc<Mutex<lru_time_cache::LruCache<String, ()>>>,
+    user_id: String,
+    config: &ProtocolConfiguration,
+    topic_signal_s: async_channel::Sender<()>,
+    kill_signal_r: async_channel::Receiver<()>,
+    read: WsReader,
+    write: &Mutex<WsWriter>,
+    kill_signal_s: async_channel::Sender<()>,
+) {
+    worker(
+        addr,
+        subscribed,
+        active_servers,
+        user_id,
+        config,
+        topic_signal_s,
+        kill_signal_r,
+        read,
+        write,
+    )
+    .await;
+    kill_signal_s.send(()).await.ok();
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn worker(
     addr: SocketAddr,
     subscribed: Arc<RwLock<HashSet<String>>>,
+    active_servers: Arc<Mutex<lru_time_cache::LruCache<String, ()>>>,
     user_id: String,
     config: &ProtocolConfiguration,
+    topic_signal_s: async_channel::Sender<()>,
+    kill_signal_r: async_channel::Receiver<()>,
     mut read: WsReader,
     write: &Mutex<WsWriter>,
 ) {
     loop {
-        let result = read.try_next().await;
-        let msg = match result {
-            Ok(Some(msg)) => msg,
-            Ok(None) => return,
-            Err(e) => {
-                use async_tungstenite::tungstenite::Error;
-                if !matches!(e, Error::AlreadyClosed | Error::ConnectionClosed) {
-                    warn!("Error while reading an event from {addr:?}: {e:?}");
-                }
+        let t1 = read.try_next().fuse();
+        let t2 = kill_signal_r.recv().fuse();
+
+        pin_mut!(t1, t2);
+
+        select! {
+            _ = t2 => {
                 return;
-            }
-        };
+            },
+            result = t1 => {
+                let msg = match result {
+                    Ok(Some(msg)) => msg,
+                    Ok(None) => {
+                        warn!("Received a None message!");
+                        sentry::capture_message("Received a None message!", Level::Warning);
+                        return;
+                    }
+                    Err(e) => {
+                        use async_tungstenite::tungstenite::Error;
+                        if !matches!(e, Error::AlreadyClosed | Error::ConnectionClosed) {
+                            let err = format!("Error while reading an event from {addr:?}: {e:?}");
+                            warn!("{}", err);
+                            sentry::capture_message(&err, Level::Warning);
+                        }
 
-        let Ok(payload) = config.decode(&msg) else {
-            continue;
-        };
+                        return;
+                    }
+                };
 
-        match payload {
-            ClientMessage::BeginTyping { channel } => {
-                if !subscribed.read().await.contains(&channel) {
+                let Ok(payload) = config.decode(&msg) else {
                     continue;
-                }
+                };
 
-                EventV1::ChannelStartTyping {
-                    id: channel.clone(),
-                    user: user_id.clone(),
-                }
-                .p(channel.clone())
-                .await;
-            }
-            ClientMessage::EndTyping { channel } => {
-                if !subscribed.read().await.contains(&channel) {
-                    continue;
-                }
+                match payload {
+                    ClientMessage::BeginTyping { channel } => {
+                        if !subscribed.read().await.contains(&channel) {
+                            continue;
+                        }
 
-                EventV1::ChannelStopTyping {
-                    id: channel.clone(),
-                    user: user_id.clone(),
+                        EventV1::ChannelStartTyping {
+                            id: channel.clone(),
+                            user: user_id.clone(),
+                        }
+                        .p(channel.clone())
+                        .await;
+                    }
+                    ClientMessage::EndTyping { channel } => {
+                        if !subscribed.read().await.contains(&channel) {
+                            continue;
+                        }
+
+                        EventV1::ChannelStopTyping {
+                            id: channel.clone(),
+                            user: user_id.clone(),
+                        }
+                        .p(channel.clone())
+                        .await;
+                    }
+                    ClientMessage::Subscribe { server_id } => {
+                        let mut servers = active_servers.lock().await;
+                        let has_item = servers.contains_key(&server_id);
+                        servers.insert(server_id, ());
+
+                        if !has_item {
+                            // Poke the listener to adjust subscriptions
+                            topic_signal_s.send(()).await.ok();
+                        }
+                    }
+                    ClientMessage::Ping { data, responded } => {
+                        if responded.is_none() {
+                            write
+                                .lock()
+                                .await
+                                .send(config.encode(&EventV1::Pong { data }))
+                                .await
+                                .ok();
+                        }
+                    }
+                    _ => {}
                 }
-                .p(channel.clone())
-                .await;
             }
-            ClientMessage::Ping { data, responded } => {
-                if responded.is_none() {
-                    write
-                        .lock()
-                        .await
-                        .send(config.encode(&EventV1::Pong { data }))
-                        .await
-                        .ok();
-                }
-            }
-            _ => {}
         }
     }
 }

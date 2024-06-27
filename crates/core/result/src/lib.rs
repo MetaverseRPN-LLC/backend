@@ -1,3 +1,5 @@
+use std::fmt::Display;
+
 #[cfg(feature = "serde")]
 #[macro_use]
 extern crate serde;
@@ -28,6 +30,14 @@ pub struct Error {
     pub location: String,
 }
 
+impl Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?} occurred in {}", self.error_type, self.location)
+    }
+}
+
+impl std::error::Error for Error {}
+
 /// Possible error types
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "serde", serde(tag = "type"))]
@@ -50,6 +60,9 @@ pub enum ErrorType {
     Blocked,
     BlockedByOther,
     NotFriends,
+    TooManyPendingFriendRequests {
+        max: usize,
+    },
 
     // ? Channel related errors
     UnknownChannel,
